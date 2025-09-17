@@ -1,0 +1,260 @@
+name: dotnet35-ci
+
+on:
+  workflow_call:
+    inputs:
+      sln_path:
+        description: 'Path to .sln at repo root'
+        required: true
+        type: string
+
+      app_project_dir:
+        description: 'Path to app project directory (where /bin/ exists), e.g. MyApp'
+        required: true
+        type: string
+
+      test_project_dir:
+        description: 'Path to test project directory (where /bin/ exists), e.g. MyApp.Tests'
+        required: true
+        type: string
+      test_assembly_name:
+        description: 'Test assembly file name, e.g. MyApp.Tests.dll'
+        required: true
+        type: string
+
+      product_prefix:
+        description: 'ZIP name prefix'
+        required: true
+        type: string
+
+      platforms_json:
+        description: 'JSON array of platforms (e.g. ["AnyCPU","x86","x64"])'
+        required: false
+        default: '["AnyCPU"]'
+        type: string
+
+      tag_prefix:
+        description: 'Tag prefix for releases (e.g. v -> v1.2.3.4)'
+        required: false
+        default: 'v'
+        type: string
+
+      run_tests:
+        description: 'Run tests?'
+        required: false
+        default: true
+        type: boolean
+
+      enable_release:
+        description: 'Publish GitHub Release on tag?'
+        required: false
+        default: true
+        type: boolean
+
+      retention_days:
+        description: 'Artifact retention days'
+        required: false
+        default: 7
+        type: number
+
+    secrets:
+      release_token:
+        required: false
+        description: 'Optional PAT for releases (falls back to GITHUB_TOKEN)'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        platform: ${{ fromJSON(inputs.platforms_json) }}
+    env:
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Enable .NET Framework 3.5
+        run: dism /online /enable-feature /featurename:NetFx3 /All
+        shell: powershell
+
+      - uses: NuGet/setup-nuget@v2
+
+      - uses: actions/cache@v4
+        with:
+          path: packages
+          key: nuget-${{ hashFiles('**/packages.config') }}
+
+      - name: Restore
+        run: nuget restore "${{ inputs.sln_path }}"
+
+      - name: Build Release (${{ env.PLATFORM }})
+        run: msbuild "${{ inputs.sln_path }}" /p:Configuration=Release /p:Platform=${{ env.PLATFORM }} /m
+
+      - name: Compute output paths (${{ env.PLATFORM }})
+        id: outpaths
+        shell: powershell
+        run: |
+          $platform = "${{ env.PLATFORM }}"
+          $appProj = "${{ inputs.app_project_dir }}"
+          $testProj = "${{ inputs.test_project_dir }}"
+          $testName = "${{ inputs.test_assembly_name }}"
+
+          function OutDir([string]$proj,[string]$plat){
+            if ($plat -ieq "AnyCPU") { return "$proj\bin\Release" }
+            else { return "$proj\bin\$plat\Release" }
+          }
+
+          $appDir  = OutDir $appProj  $platform
+          $testDir = OutDir $testProj $platform
+          $testDll = Join-Path $testDir $testName
+
+          "app_release_dir=$appDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "test_dir=$testDir"       | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "test_dll=$testDll"       | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Upload build outputs (${{ env.PLATFORM }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-outputs-${{ env.PLATFORM }}
+          path: |
+            ${{ steps.outpaths.outputs.app_release_dir }}\**
+            ${{ steps.outpaths.outputs.test_dir }}\**
+          retention-days: ${{ inputs.retention_days }}
+
+  test:
+    if: ${{ inputs.run_tests }}
+    runs-on: windows-latest
+    needs: build
+    strategy:
+      matrix:
+        platform: ${{ fromJSON(inputs.platforms_json) }}
+    env:
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build outputs (${{ env.PLATFORM }})
+        uses: actions/download-artifact@v4
+        with:
+          name: build-outputs-${{ env.PLATFORM }}
+          path: .
+
+      - name: Install NUnit Console Runner (CLI)
+        run: nuget install NUnit.ConsoleRunner -Version 3.17.0 -OutputDirectory .\testrunner
+
+      - name: Locate test DLL (${{ env.PLATFORM }})
+        id: tpaths
+        shell: powershell
+        run: |
+          $platform = "${{ env.PLATFORM }}"
+          $testProj = "${{ inputs.test_project_dir }}"
+          $testName = "${{ inputs.test_assembly_name }}"
+          if ($platform -ieq "AnyCPU") { $testDir = "$testProj\bin\Release" } else { $testDir = "$testProj\bin\$platform\Release" }
+          $dll = Join-Path $testDir $testName
+          if (!(Test-Path $dll)) { throw "Test assembly not found at $dll" }
+          "test_dll=$dll" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Run NUnit tests (${{ env.PLATFORM }})
+        shell: powershell
+        run: |
+          $runner = Get-ChildItem -Recurse -Path . -Filter "nunit3-console.exe" | Select-Object -First 1
+          if (-not $runner) { throw "nunit3-console.exe not found." }
+          $dll = "${{ steps.tpaths.outputs.test_dll }}"
+          & $runner.FullName $dll --noheader --framework:net-3.5 --result:"TestResult_${{ env.PLATFORM }}.xml;format=nunit3"
+          if ($LASTEXITCODE -ne 0) { throw "Tests failed with exit code $LASTEXITCODE" }
+
+      - name: Upload test results (${{ env.PLATFORM }})
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nunit-results-${{ env.PLATFORM }}
+          path: TestResult_${{ env.PLATFORM }}.xml
+          retention-days: ${{ inputs.retention_days }}
+
+  package:
+    runs-on: windows-latest
+    needs: [build, test]
+    strategy:
+      matrix:
+        platform: ${{ fromJSON(inputs.platforms_json) }}
+    env:
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build outputs (${{ env.PLATFORM }})
+        uses: actions/download-artifact@v4
+        with:
+          name: build-outputs-${{ env.PLATFORM }}
+          path: .
+
+      - name: Determine version
+        id: ver
+        shell: bash
+        run: |
+          ref="${GITHUB_REF_NAME}"
+          prefix="${{ inputs.tag_prefix }}"
+          if [[ "$ref" == ${prefix}* ]]; then
+            ver="${ref#${prefix}}"
+          else
+            ver="0.0.0-${GITHUB_RUN_NUMBER}"
+          fi
+          echo "version=$ver" >> $GITHUB_OUTPUT
+          echo "Resolved version: $ver"
+
+      - name: Compute app dir (${{ env.PLATFORM }})
+        id: ppaths
+        shell: powershell
+        run: |
+          $platform = "${{ env.PLATFORM }}"
+          $appProj = "${{ inputs.app_project_dir }}"
+          if ($platform -ieq "AnyCPU") { $appDir = "$appProj\bin\Release" } else { $appDir = "$appProj\bin\$platform\Release" }
+          if (!(Test-Path $appDir)) { throw "Release output not found: $appDir" }
+          "app_release_dir=$appDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Package versioned ZIP (${{ env.PLATFORM }})
+        id: pkg
+        shell: powershell
+        run: |
+          $dir = "${{ steps.ppaths.outputs.app_release_dir }}"
+          $ver = "${{ steps.ver.outputs.version }}"
+          $zipname = "${{ inputs.product_prefix }}_${{ env.PLATFORM }}_v$ver.zip"
+          if (Test-Path $zipname) { Remove-Item $zipname -Force }
+          Compress-Archive -Path "$dir\*" -DestinationPath $zipname -Force
+          echo "zipname=$zipname" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Upload versioned ZIP artifact (${{ env.PLATFORM }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: packaged-zip-${{ env.PLATFORM }}
+          path: ${{ steps.pkg.outputs.zipname }}
+          retention-days: ${{ inputs.retention_days }}
+
+  release:
+    runs-on: windows-latest
+    needs: package
+    if: ${{ inputs.enable_release && github.event_name == 'push' && startsWith(github.ref, format('refs/tags/{0}', inputs.tag_prefix)) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all packaged ZIPs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: packaged-zip-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release (attach all zips)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist\*.zip
+          generate_release_notes: true
+          token: ${{ secrets.release_token || secrets.GITHUB_TOKEN }}
