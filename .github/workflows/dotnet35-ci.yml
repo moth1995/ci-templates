@@ -260,9 +260,19 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: List downloaded files
+        shell: pwsh
+        run: |
+          Write-Host "Contents of dist:"
+          if (Test-Path dist) {
+            Get-ChildItem -Recurse -Path dist | ForEach-Object { Write-Host $_.FullName }
+          } else {
+            throw "dist folder not found"
+          }
+
       - name: Create GitHub Release (attach all zips)
         uses: softprops/action-gh-release@v2
         with:
-          files: dist\*.zip
+          files: dist/*.zip
           generate_release_notes: true
           token: ${{ secrets.release_token || secrets.GITHUB_TOKEN }}
