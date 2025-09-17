@@ -95,8 +95,16 @@ jobs:
       - name: Restore
         run: nuget restore "${{ inputs.sln_path }}"
 
+      - name: Compute MSBuild Platform (${{ env.PLATFORM }})
+        id: msplat
+        shell: pwsh
+        run: |
+          $p = "${{ env.PLATFORM }}"
+          if ($p -ieq "AnyCPU" -or $p -ieq "AnyCpu") { $ms = "Any CPU" } else { $ms = $p }
+          "value=$ms" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
       - name: Build Release (${{ env.PLATFORM }})
-        run: msbuild "${{ inputs.sln_path }}" /p:Configuration=Release /p:Platform=${{ env.PLATFORM }} /m
+        run: msbuild "${{ inputs.sln_path }}" /p:Configuration=Release /p:Platform="${{ steps.msplat.outputs.value }}" /m
 
       - name: Compute output paths (${{ env.PLATFORM }})
         id: outpaths
