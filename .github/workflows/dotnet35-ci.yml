@@ -189,7 +189,7 @@ jobs:
 
   package:
     runs-on: windows-latest
-    needs: [build, test]
+    needs: [build]
     strategy:
       matrix:
         platform: ${{ fromJSON(inputs.platforms_json) }}
